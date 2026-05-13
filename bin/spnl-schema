@@ -1,0 +1,73 @@
+#!/usr/bin/env ruby
+# Usage:
+#   spnl-schema <schema.sql>                    # 全 table を stdout に
+#   spnl-schema <schema.sql> --table users      # 1 table だけ
+#   spnl-schema <schema.sql> --out-dir app/models/   # table 毎にファイル分割
+#   spnl-schema --check <schema.sql>            # parse のみ, 0/1 で終了
+#   spnl-schema -h
+
+require_relative "../lib/spnl_schema"
+
+def usage
+  puts <<~U
+    spnl-schema v#{SpnlSchema::VERSION}
+
+    Usage:
+      spnl-schema <schema.sql>                 print all model classes to stdout
+      spnl-schema <schema.sql> --table NAME    print one table's class
+      spnl-schema <schema.sql> --out-dir DIR   write each table to DIR/<name>.generated.rb
+      spnl-schema --check <schema.sql>         parse only, exit 0 if OK
+      spnl-schema -h | --help
+  U
+  exit 0
+end
+
+if ARGV.empty? || ARGV.include?("-h") || ARGV.include?("--help")
+  usage
+end
+
+if ARGV[0] == "--check"
+  sql = File.read(ARGV[1])
+  tables = SpnlSchema.parse(sql)
+  warn "spnl-schema: parsed #{tables.length} table(s)"
+  exit 0
+end
+
+sql_path = ARGV.shift
+sql = File.read(sql_path)
+tables = SpnlSchema.parse(sql)
+
+filter_table = nil
+out_dir = nil
+while (opt = ARGV.shift)
+  case opt
+  when "--table"   then filter_table = ARGV.shift
+  when "--out-dir" then out_dir = ARGV.shift
+  else
+    warn "spnl-schema: unknown option #{opt}"
+    exit 1
+  end
+end
+
+tables = tables.select { |t| t[:name] == filter_table } if filter_table
+
+if tables.empty?
+  warn "spnl-schema: no table matched"
+  exit 1
+end
+
+if out_dir
+  Dir.mkdir(out_dir) unless Dir.exist?(out_dir)
+  tables.each do |t|
+    # users -> user.generated.rb (singular)
+    singular = t[:name].chomp("s")
+    path = File.join(out_dir, "#{singular}.generated.rb")
+    File.write(path, SpnlSchema.emit_class(t))
+    puts "wrote #{path}"
+  end
+else
+  tables.each do |t|
+    puts SpnlSchema.emit_class(t)
+    puts
+  end
+end
