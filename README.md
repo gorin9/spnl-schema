@@ -1,236 +1,51 @@
 # spnl-schema
 
-[matz/spinel](https://github.com/matz/spinel) 向け **ビルド時 SQL → Ruby model コンパイラ**.
-[gorin9/spnl-erb](https://github.com/gorin9/spnl-erb) と同じ思想で,
-DB schema を **コンパイル前に static Ruby に変換**する.
-
-## なぜ必要か
-
-ActiveRecord は runtime に `desc table_name` → `method_missing` で attribute accessor を動的生成する.
-Spinel は AOT で `method_missing` を持たないため, この方式は構造的に不可能.
-
-代わりに **ビルド時 (CRuby)** に `CREATE TABLE` 文を読んで,
-Rails 風 API (`User.find(id)`, `User.find_by_email(x)` 等) を持つ static Ruby を出力する.
-
-```
-db/schema.sql              spnl-schema      app/models/user.generated.rb       spinel compile
-CREATE TABLE users ...  ─────────────────►  class User                       ─────────────────►  native binary
-                                              attr_accessor :id, :email
-                                              def self.find(id) ...
-                                              def self.find_by_email(x) ...
-                                              ...
-                                            end
-```
-
-## インストール
-
-依存: CRuby (ビルド機にのみ).
+Trusted SQLite schema → static Ruby models + optional RBS, compiled on the CRuby build host.
+Install the sqlite3 gem. The generator uses an in-memory SQLite database and PRAGMA
+metadata instead of attempting to parse SQL with regular expressions.
 
 ```sh
-git clone https://github.com/gorin9/spnl-schema.git ~/.local/spnl-schema
-sudo ln -s ~/.local/spnl-schema/bin/spnl-schema /usr/local/bin/spnl-schema
+ruby bin/spnl-schema db/schema.sql --out-dir app/models --rbs-dir sig
+ruby bin/spnl-schema --check db/schema.sql
 ```
 
-または `spinel-packer install gorin9/spnl-schema`.
-
-## 使い方
-
-### 入力
-
-```sql
--- db/schema.sql
-CREATE TABLE users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  email TEXT NOT NULL UNIQUE,
-  name TEXT NOT NULL,
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL
-);
-```
-
-### 実行
-
-```sh
-$ spnl-schema db/schema.sql --out-dir app/models/
-wrote app/models/user.generated.rb
-```
-
-### 出力
+Exactly one INTEGER primary key per table is supported, in any column position and
+under any valid Ruby identifier. Unsupported/missing/composite keys and unsupported
+identifiers/types fail explicitly. SQL quoting, quoted commas, foreign keys, defaults
+and nullability are read by SQLite. Ruby defaults use literal values; SQLite computes
+nonliteral defaults. Required create parameters precede optional ones; see generated
+method signatures when migrating a schema that has defaults. RBS describes fields,
+constructor, lookup, collection, count and persistence methods.
 
 ```ruby
-# AUTO-GENERATED from schema.sql by spnl-schema — DO NOT EDIT
-class User
-  attr_accessor :id, :email, :name, :created_at, :updated_at
-
-  TABLE = "users"
-  COLS  = "id, email, name, created_at, updated_at"
-
-  def initialize(id, email, name, created_at, updated_at)
-    @id = id
-    @email = email
-    # ...
-  end
-
-  def self.from_row(row)
-    User.new(row["id"], row["email"], row["name"], row["created_at"], row["updated_at"])
-  end
-
-  def self.find(id)
-    row = DB.fetch_one("SELECT #{COLS} FROM #{TABLE} WHERE id=?", [id])
-    return nil if row.nil?
-    from_row(row)
-  end
-
-  def self.find!(id)
-    x = find(id)
-    raise "User not found: #{id}" if x.nil?
-    x
-  end
-
-  def self.all
-    out = []
-    DB.fetch_all("SELECT #{COLS} FROM #{TABLE} ORDER BY id").each do |r|
-      out.push(from_row(r))
-    end
-    out
-  end
-
-  def self.count
-    DB.fetch_one("SELECT COUNT(*) AS n FROM #{TABLE}")["n"]
-  end
-
-  def self.where_email(email) ... end
-  def self.find_by_email(email) ... end
-  def self.where_name(name) ... end
-  def self.find_by_name(name) ... end
-
-  def self.create(email, name, created_at, updated_at)
-    id = DB.exec_returning_id(...)
-    User.new(id, email, name, created_at, updated_at)
-  end
-
-  def save
-    DB.exec("UPDATE #{TABLE} SET email=?, name=?, ... WHERE id=?",
-            [@email, @name, ..., @id])
-  end
-
-  def destroy
-    DB.exec("DELETE FROM #{TABLE} WHERE id=?", [@id])
-  end
-end
+require "spnl_schema/sqlite_adapter"
+DB = SpnlSchema::SQLiteAdapter.new("app.sqlite3")
+require_relative "app/models/user.generated"
+user = User.create("Alice") # actual signature depends on schema
 ```
 
-### ファイル分割の規約
+The adapter binds values, never interpolates them into SQL. It supplies fetch_one,
+fetch_all, exec, exec_returning_id, transaction and close. Generated models use DB,
+matching the original injection contract. Migration/schema application is explicit;
+opening an adapter does not execute a schema automatically. The adapter serializes calls with a reentrant Monitor, including transactions and
+last-insert-id reads. Independent adapters are still needed for independent connections.
 
-人間とジェネレータの責任分離 (Rails の `db/schema.rb` と `app/models/user.rb` 流):
+The host adapter works with CRuby's sqlite3 gem. The bundled Spinel sqlite3 C-extension
+package exists at pinned master 60c02732, **not** release 2026.10.25. Stable CI tests
+models without a DB runtime and full CRUD/rollback on CRuby. Master additionally tests
+compiled SQLite CRUD via `SPNL_SQLITE_RUNTIME=1 ruby scripts/verify_runtime.rb`.
+Building master must detect sqlite3 development headers/library so its native package
+is built; a source directory by itself is not sufficient.
 
-```
-app/models/
-├── user.rb              ← 人が書く: business logic だけ
-└── user.generated.rb    ← spnl-schema が出力: attr, find, save 等
-```
+## Compatibility and verification
 
-`user.rb`:
-```ruby
-require_relative "user.generated"
+Supported baseline: Spinel `2026.10.25` (Linux) and CRuby 3.1+. CI also checks the
+reference master commit `60c0273261415d2b5edd6480667a705a68addbd2`; this is a pinned
+comparison, not an assertion about every future master build. Check CHANGELOG before upgrading.
+No performance or binary-size claim is inherited from the May prototype.
 
-class User                         # ← open class reopen
-  def display_name
-    "Mr. #{@name}"
-  end
+Run `rake test`. Runtime packages additionally use `spin test`; generator repositories
+use `ruby scripts/verify_runtime.rb` to compile their generated code and compare with CRuby.
+See CONTRIBUTING.md. Original notes are in `docs/historical-readme-may-2026.md`.
 
-  def admin?
-    @email.end_with?("@admin.com")
-  end
-end
-```
-
-Spinel は class reopen を別ファイル間でも問題なく扱える (検証済).
-
-### `DB` モジュール (利用側で実装)
-
-生成された model は `DB` モジュールに以下の signature を要求する:
-
-```ruby
-module DB
-  def self.fetch_one(sql, args)        # -> Hash<String, val> or nil
-  def self.fetch_all(sql, args = nil)  # -> Array<Hash>
-  def self.exec(sql, args)             # -> nil
-  def self.exec_returning_id(sql, args) # -> Integer (last insert rowid)
-end
-```
-
-[gorin9/spnl-web](https://github.com/gorin9/spnl-web) の SQLite ラッパが
-これを提供する想定 (実装は別途).
-
-## CLI
-
-```sh
-spnl-schema <schema.sql>                  # 全 table を stdout に
-spnl-schema <schema.sql> --table users    # 1 table だけ
-spnl-schema <schema.sql> --out-dir DIR    # 個別ファイル化
-spnl-schema --check <schema.sql>          # parse のみ (CI 向け)
-```
-
-## SQL 文法サポート
-
-| 文法 | 状態 |
-|---|---|
-| `CREATE TABLE name (...)` | ✅ |
-| `CREATE TABLE IF NOT EXISTS name (...)` | ✅ |
-| `INTEGER` / `BIGINT` | ✅ → `:int` |
-| `TEXT` / `VARCHAR` / `CHAR` | ✅ → `:str` |
-| `REAL` / `FLOAT` / `DOUBLE` | ✅ → `:real` |
-| `BLOB` | ✅ → `:str` (binary) |
-| `BOOLEAN` | ✅ → `:int` (0/1) |
-| `PRIMARY KEY` (column-level) | ✅ 無視 |
-| `NOT NULL` / `UNIQUE` / `DEFAULT` | ✅ 無視 |
-| `FOREIGN KEY ... REFERENCES ...` | ✅ 無視 (table-level) |
-| `CHECK (...)` / `CONSTRAINT ...` | ✅ 無視 |
-
-→ **constraints は SQL で表現すれば良い**ので Ruby 側に持ち込まない.
-
-## 生成される method (1 テーブルあたり)
-
-| Method | 用途 |
-|---|---|
-| `Klass.find(id)` | 主キー検索, 無ければ `nil` |
-| `Klass.find!(id)` | 同上, 無ければ raise |
-| `Klass.all` | 全件 (`ORDER BY id`) |
-| `Klass.count` | 件数 |
-| `Klass.where_<col>(val)` | TEXT 列で WHERE 検索 (Array 返却) |
-| `Klass.find_by_<col>(val)` | 同上 (先頭 1 件 or nil) |
-| `Klass.create(...)` | INSERT し新しい instance 返却 |
-| `inst.save` | UPDATE (id をキーに) |
-| `inst.destroy` | DELETE |
-| `Klass.from_row(row)` | DB hash → instance 変換ヘルパ |
-
-## ワークフロー統合
-
-### Makefile
-
-```make
-MODELS := $(patsubst %,app/models/%.generated.rb,$(shell sed -n 's/CREATE TABLE \([a-z_]*\).*/\1/p' db/schema.sql | sed 's/s$$//'))
-
-app/models/%.generated.rb: db/schema.sql
-	spnl-schema db/schema.sql --out-dir app/models/
-
-build: $(MODELS)
-	spinel httpd.rb -o bin/app
-```
-
-### `.gitignore` 議論
-
-`*.generated.rb` は **コミット推奨** (`db/schema.rb` 流).
-
-## 関連プロジェクト
-
-- [matz/spinel](https://github.com/matz/spinel) — 本家
-- [gorin9/spinel-packer](https://github.com/gorin9/spinel-packer) — install/lock ツール
-- [gorin9/spnl-erb](https://github.com/gorin9/spnl-erb) — ビルド時 ERB コンパイラ (同じ思想)
-- [gorin9/spnl-web](https://github.com/gorin9/spnl-web) — Web framework, DB アダプタ提供想定
-- [gorin9/spnl-support](https://github.com/gorin9/spnl-support) — ActiveSupport 風 helper
-
-## ライセンス
-
-MIT
+MIT licensed. Development version; no gem or package-index release is published automatically.

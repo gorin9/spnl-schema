@@ -1,194 +1,145 @@
-# spnl-schema: SQL CREATE TABLE -> Spinel-friendly model class
-#
-# 設計:
-# - ビルド時 (CRuby) に走る
-# - 出力は Spinel が AOT-compile できる pure Ruby
-# - Rails-like `User.find(id)` API を生成
-# - DB アダプタは別 (spnl-web の sqlite ラッパ等を想定)
-#
-# 入力 SQL の制約:
-# - CREATE TABLE <name> (col1 TYPE, col2 TYPE, ...);
-# - PRIMARY KEY / NOT NULL / DEFAULT は無視 (型情報は ruby 側でみない)
-# - FOREIGN KEY も無視
-# - INTEGER / TEXT / REAL / BLOB を区別 (cast 用)
+# frozen_string_literal: true
+require "sqlite3"
 
 module SpnlSchema
-  VERSION = "0.1.0"
+  VERSION = "0.2.0"
+  TYPE_MAP = {"INTEGER" => :int, "INT" => :int, "BIGINT" => :int, "TEXT" => :str, "VARCHAR" => :str, "CHAR" => :str, "REAL" => :real, "FLOAT" => :real, "DOUBLE" => :real, "BLOB" => :str, "BOOLEAN" => :int}
 
-  TYPE_MAP = {
-    "integer" => :int,
-    "int"     => :int,
-    "bigint"  => :int,
-    "text"    => :str,
-    "varchar" => :str,
-    "char"    => :str,
-    "real"    => :real,
-    "float"   => :real,
-    "double"  => :real,
-    "blob"    => :str,
-    "boolean" => :int
-  }
+  def self.classify(name)
+    words = name.split('_')
+    last = words.pop
+    singular = {'people'=>'person','children'=>'child','statuses'=>'status'}.fetch(last) do
+      last.end_with?('ies') ? last.sub(/ies\z/, 'y') : last.end_with?('sses') ? last.sub(/es\z/, '') : last.sub(/s\z/, '')
+    end
+    (words + [singular]).map(&:capitalize).join
+  end
 
-  # 戻り値: [{ name: "users", class_name: "User", cols: [{name:"id", type::int}, ...] }, ...]
   def self.parse(sql)
-    tables = []
-    sql.scan(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\((.*?)\);/im) do |name, body|
-      cols = parse_columns(body)
-      tables << {
-        name: name,
-        class_name: classify(name),
-        cols: cols
-      }
-    end
-    tables
-  end
-
-  def self.parse_columns(body)
-    cols = []
-    # 簡易 split: トップレベルのカンマで切る (FK 等の括弧内カンマは無視想定)
-    depth = 0
-    buf = ""
-    body.each_char do |ch|
-      if ch == "(" then depth += 1
-      elsif ch == ")" then depth -= 1
+    db = SQLite3::Database.new(':memory:')
+    # Schemas are trusted build inputs, executed only in a disposable database.
+    db.execute_batch(sql)
+    names = db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").flatten
+    raise ArgumentError, 'schema contains no tables' if names.empty?
+    names.map do |name|
+      raise ArgumentError, "unsupported table identifier #{name.inspect}" unless name.match?(/\A[a-z_]\w*\z/)
+      metadata = db.execute('PRAGMA table_list').find { |row| row[1] == name }
+      primary_index = db.execute("PRAGMA index_list(#{quote(name)})").any? { |row| row[3] == 'pk' }
+      raise ArgumentError, "#{name}: rowid-backed INTEGER primary key required" if (metadata && metadata[4] == 1) || primary_index
+      rows = db.execute("PRAGMA table_info(#{quote(name)})")
+      cols = rows.map do |row|
+        _, col, type, notnull, default, pk = row
+        raise ArgumentError, "unsupported column identifier #{col.inspect}" unless col.match?(/\A[a-z_]\w*\z/) && !%w[class def end self nil true false initialize save destroy object_id send method public_send].include?(col)
+        base = type.to_s.upcase.sub(/\(.*/, '').strip
+        kind = TYPE_MAP[base]
+        raise ArgumentError, "unsupported type #{type.inspect} for #{col}" unless kind
+        {name: col, type: kind, nullable: notnull == 0 && pk == 0, default: default, primary_key: pk > 0, declared_type: base}
       end
-      if ch == "," && depth == 0
-        cols << parse_column_line(buf)
-        buf = ""
-      else
-        buf += ch
-      end
+      keys = cols.select { |c| c[:primary_key] }
+      raise ArgumentError, "#{name}: exactly one INTEGER primary key required" unless keys.length == 1 && keys[0][:declared_type] == 'INTEGER'
+      raise ArgumentError, "#{name}: model requires a non-key column" if cols.length < 2
+      {name: name, class_name: classify(name), cols: cols, primary_key: keys[0][:name]}
     end
-    cols << parse_column_line(buf) unless buf.strip.empty?
-    cols.compact
+  rescue SQLite3::Exception => e
+    raise ArgumentError, "invalid SQLite schema: #{e.message}"
+  ensure
+    db.close if db
   end
 
-  def self.parse_column_line(line)
-    s = line.strip
-    return nil if s.empty?
-    # PRIMARY KEY () / FOREIGN KEY () / UNIQUE () のような table-level 制約は skip
-    return nil if s =~ /\A(PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE|CHECK|CONSTRAINT)\b/i
+  def self.quote(name); '"' + name.gsub('"', '""') + '"'; end
 
-    parts = s.split(/\s+/)
-    name = parts[0]
-    type_token = (parts[1] || "TEXT").gsub(/\(.*?\)/, "").downcase
-    sym_type = TYPE_MAP[type_token] || :str
-    { name: name, type: sym_type }
+  def self.ruby_default(column)
+    raw = column[:default]
+    return 'nil' if raw.nil? && column[:nullable]
+    return nil if raw.nil?
+    return 'nil' if raw.upcase == 'NULL'
+    return raw if raw.match?(/\A-?\d+(?:\.\d+)?\z/)
+    return raw[1...-1].gsub("''", "'").inspect if raw.start_with?("'") && raw.end_with?("'")
+    nil # Expressions such as CURRENT_TIMESTAMP are left to SQLite.
   end
 
-  # users -> User, user_profiles -> UserProfile
-  def self.classify(table_name)
-    table_name.split("_").map { |w|
-      # 雑な singularize: 末尾 's' を落とす
-      w = w.chomp("s") if w.end_with?("s") && w.length > 1
-      w.capitalize
-    }.join
-  end
-
-  # 1 テーブル -> 1 クラスの Ruby ソースを生成
   def self.emit_class(table)
-    cls   = table[:class_name]
-    tbl   = table[:name]
-    cols  = table[:cols]
+    cls, cols, key = table.values_at(:class_name, :cols, :primary_key)
+    key ||= 'id'
     names = cols.map { |c| c[:name] }
-    cols_str = names.join(", ")
-
-    attr_list   = names.map { |n| ":#{n}" }.join(", ")
-    init_params = names.join(", ")
-    init_body   = names.map { |n| "    @#{n} = #{n}" }.join("\n")
-    new_args    = names.map { |n| "row[\"#{n}\"]" }.join(", ")
-    save_set    = names.reject { |n| n == "id" }.map { |n| "#{n}=?" }.join(", ")
-    save_vals   = names.reject { |n| n == "id" }.map { |n| "@#{n}" }.join(", ")
-
-    # WHERE methods: skip id (find が担当), 文字列カラムだけ where_<col>
-    where_methods = cols.select { |c| c[:type] == :str && c[:name] != "id" }.map { |c|
-      emit_where_method(cls, tbl, cols_str, names, c[:name])
-    }.join("\n")
-
-    create_cols = names.reject { |n| n == "id" }
-    create_params = create_cols.join(", ")
-    create_placeholders = (["?"] * create_cols.length).join(", ")
-    create_args = create_cols.map { |n| n }.join(", ")
-    create_call_args = ([nil] + create_cols).map { |n| n ? n : "id" }.join(", ")
-
-    <<~RUBY
-      # AUTO-GENERATED from schema.sql by spnl-schema — DO NOT EDIT
-      class #{cls}
-        attr_accessor #{attr_list}
-
-        TABLE = "#{tbl}"
-        COLS  = "#{cols_str}"
-
-        def initialize(#{init_params})
-      #{init_body}
-        end
-
-        def self.from_row(row)
-          #{cls}.new(#{new_args})
-        end
-
-        def self.find(id)
-          row = DB.fetch_one("SELECT \#{COLS} FROM \#{TABLE} WHERE id=?", [id])
-          return nil if row.nil?
-          from_row(row)
-        end
-
-        def self.find!(id)
-          x = find(id)
-          raise "#{cls} not found: \#{id}" if x.nil?
-          x
-        end
-
-        def self.all
-          out = []
-          DB.fetch_all("SELECT \#{COLS} FROM \#{TABLE} ORDER BY id").each do |r|
-            out.push(from_row(r))
+    writable = cols.reject { |c| c[:name] == key }
+    create = writable.reject { |c| c[:default] && ruby_default(c).nil? }
+    required, optional = create.partition { |c| ruby_default(c).nil? }
+    args = required + optional
+    params = args.map { |c| d=ruby_default(c); d ? "#{c[:name]} = #{d}" : c[:name] }.join(', ')
+    table_sql = quote(table[:name]); select_sql = names.map { |n| quote(n) }.join(', ')
+    select = "SELECT #{select_sql} FROM #{table_sql}"
+    insert = "INSERT INTO #{table_sql}(#{args.map { |c| quote(c[:name]) }.join(', ')}) VALUES(#{(['?']*args.length).join(', ')})"
+    insert = "INSERT INTO #{table_sql} DEFAULT VALUES" if args.empty?
+    updates = writable.map { |c| "#{quote(c[:name])}=?" }.join(', ')
+    finders = writable.map do |c|
+      col = c[:name]
+      <<~RB
+          def self.where_#{col}(value)
+            DB.fetch_all(#{(select + ' WHERE ' + quote(col) + '=?').inspect}, [value]).map { |row| from_row(row) }
           end
-          out
+          def self.find_by_#{col}(value)
+            row = DB.fetch_one(#{(select + ' WHERE ' + quote(col) + '=? LIMIT 1').inspect}, [value])
+            row.nil? ? nil : from_row(row)
+          end
+      RB
+    end.join
+    <<~RB
+      # AUTO-GENERATED by spnl-schema #{VERSION}; do not edit
+      class #{cls}
+        attr_accessor #{names.map { |n| ':'+n }.join(', ')}
+        TABLE = #{table[:name].inspect}
+        COLS = #{select_sql.inspect}
+        def initialize(#{names.join(', ')})
+      #{names.map { |n| "    @#{n} = #{n}" }.join("\n")}
         end
-
+        def self.from_row(row)
+          new(#{cols.map { |c| v="row[#{c[:name].inspect}]"; cast={int:'.to_i',real:'.to_f',str:'.to_s'}[c[:type]]; c[:nullable] ? "(#{v}.nil? ? nil : #{v}#{cast})" : "#{v}#{cast}" }.join(', ')})
+        end
+        def self.find(key)
+          row = DB.fetch_one(#{(select+' WHERE '+quote(key)+'=?').inspect}, [key])
+          row.nil? ? nil : from_row(row)
+        end
+        def self.find!(key)
+          value = find(key)
+          raise "#{cls} not found" if value.nil?
+          value
+        end
+        def self.all
+          DB.fetch_all(#{(select+' ORDER BY '+quote(key)).inspect}, []).map { |row| from_row(row) }
+        end
         def self.count
-          DB.fetch_one("SELECT COUNT(*) AS n FROM \#{TABLE}")["n"]
+          DB.fetch_one(#{('SELECT COUNT(*) AS n FROM '+table_sql).inspect}, [])["n"].to_i
         end
-      #{where_methods}
-        def self.create(#{create_params})
-          id = DB.exec_returning_id(
-            "INSERT INTO \#{TABLE}(#{create_cols.join(', ')}) VALUES(#{create_placeholders})",
-            [#{create_args}]
-          )
-          #{cls}.new(#{create_call_args})
+        def self.create(#{params})
+          key = DB.exec_returning_id(#{insert.inspect}, [#{args.map { |c| c[:name] }.join(', ')}])
+          find!(key)
         end
-
         def save
-          DB.exec(
-            "UPDATE \#{TABLE} SET #{save_set} WHERE id=?",
-            [#{save_vals}, @id]
-          )
+          DB.exec(#{('UPDATE '+table_sql+' SET '+updates+' WHERE '+quote(key)+'=?').inspect}, [#{writable.map { |c| '@'+c[:name] }.join(', ')}, @#{key}])
+          self
         end
-
         def destroy
-          DB.exec("DELETE FROM \#{TABLE} WHERE id=?", [@id])
+          DB.exec(#{('DELETE FROM '+table_sql+' WHERE '+quote(key)+'=?').inspect}, [@#{key}])
+          self
         end
+      #{finders}
       end
-    RUBY
+    RB
   end
 
-  def self.emit_where_method(cls, tbl, cols_str, names, col)
-    <<~RUBY.chomp + "\n"
-
-        def self.where_#{col}(#{col})
-          out = []
-          DB.fetch_all("SELECT \#{COLS} FROM \#{TABLE} WHERE #{col}=?", [#{col}]).each do |r|
-            out.push(from_row(r))
-          end
-          out
-        end
-
-        def self.find_by_#{col}(#{col})
-          row = DB.fetch_one("SELECT \#{COLS} FROM \#{TABLE} WHERE #{col}=? LIMIT 1", [#{col}])
-          return nil if row.nil?
-          from_row(row)
-        end
-    RUBY
+  def self.emit_rbs(table)
+    name = table[:class_name]
+    cols = table[:cols]
+    types = cols.map { |c| t={int:'Integer',real:'Float',str:'String'}[c[:type]]; c[:nullable] ? "#{t}?" : t }
+    key = table[:primary_key]
+    create = cols.reject { |c| c[:name] == key || (c[:default] && ruby_default(c).nil?) }
+    required, optional = create.partition { |c| ruby_default(c).nil? }
+    arg_type = ->(c) { t={int:'Integer',real:'Float',str:'String'}[c[:type]]; c[:nullable] ? "#{t}?" : t }
+    parameters = (required + optional).map { |c| (ruby_default(c).nil? ? '' : '?') + arg_type.call(c) }
+    finders = cols.reject { |c| c[:name] == key }.map do |c|
+      "  def self.where_#{c[:name]}: (#{arg_type.call(c)}) -> Array[#{name}]\n  def self.find_by_#{c[:name]}: (#{arg_type.call(c)}) -> #{name}?\n"
+    end.join
+    "class #{name}\n" + cols.zip(types).map { |c,t| "  attr_accessor #{c[:name]}: #{t}\n" }.join +
+      "  def initialize: (#{types.join(', ')}) -> void\n  def self.find: (Integer) -> #{name}?\n  def self.find!: (Integer) -> #{name}\n  def self.all: () -> Array[#{name}]\n  def self.count: () -> Integer\n  def self.create: (#{parameters.join(', ')}) -> #{name}\n#{finders}  def save: () -> #{name}\n  def destroy: () -> #{name}\nend\n"
   end
 end

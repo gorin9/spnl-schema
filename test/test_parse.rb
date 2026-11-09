@@ -1,64 +1,31 @@
-#!/usr/bin/env ruby
-require_relative "../lib/spnl_schema"
-
-def assert(cond, msg)
-  unless cond
-    warn "FAIL: #{msg}"
-    exit 1
+require_relative '../lib/spnl_schema'
+require_relative '../lib/spnl_schema/sqlite_adapter'
+def assert(x, msg); raise msg unless x; end
+sql = "CREATE TABLE users(name TEXT NOT NULL, id INTEGER PRIMARY KEY, note TEXT DEFAULT 'a,b', score REAL);"
+table = SpnlSchema.parse(sql).first
+assert(table[:cols].map { |c| c[:name] } == %w[name id note score], 'quoted SQL/default')
+assert(table[:primary_key] == 'id', 'key position')
+assert(SpnlSchema.emit_rbs(table).include?('Float?'), 'nullable RBS')
+DB = SpnlSchema::SQLiteAdapter.new(':memory:')
+DB.exec(sql)
+eval(SpnlSchema.emit_class(table))
+u = User.create('Alice')
+assert(u.name == 'Alice' && u.id == 1 && u.note == 'a,b' && u.score.nil?, 'create order/default/null')
+u.name = '雪'; u.save
+assert(User.find(1).name == '雪', 'update')
+assert(User.count == 1 && User.where_name('雪').length == 1, 'count/binds')
+assert(User.find_by_name("' OR 1=1 --").nil?, 'SQL binding')
+begin
+  DB.transaction { User.create('rollback'); raise 'rollback' }
+rescue RuntimeError
+end
+assert(User.count == 1, 'transaction rollback')
+u.destroy
+assert(User.find(1).nil? && User.count == 0, 'delete/missing')
+['', 'not sql', 'CREATE TABLE bad(a TEXT PRIMARY KEY);', 'CREATE TABLE bad(a INTEGER,b INTEGER,PRIMARY KEY(a,b));'].each do |s|
+  begin
+    SpnlSchema.parse(s); raise 'accepted invalid schema'
+  rescue ArgumentError
   end
 end
-
-# --- parse single table ---
-sql = "CREATE TABLE users (id INTEGER, email TEXT NOT NULL);"
-tables = SpnlSchema.parse(sql)
-assert tables.length == 1,                          "one table"
-assert tables[0][:name] == "users",                 "table name"
-assert tables[0][:class_name] == "User",            "class name singularized"
-assert tables[0][:cols].length == 2,                "two cols"
-assert tables[0][:cols][0][:name] == "id",          "first col name"
-assert tables[0][:cols][0][:type] == :int,          "first col type"
-assert tables[0][:cols][1][:type] == :str,          "second col type"
-
-# --- multiple tables + FK skip ---
-sql = <<~SQL
-  CREATE TABLE users (
-    id INTEGER PRIMARY KEY,
-    name TEXT NOT NULL
-  );
-  CREATE TABLE posts (
-    id INTEGER PRIMARY KEY,
-    user_id INTEGER,
-    title TEXT,
-    FOREIGN KEY (user_id) REFERENCES users(id)
-  );
-SQL
-tables = SpnlSchema.parse(sql)
-assert tables.length == 2,                          "two tables"
-assert tables[1][:cols].map { |c| c[:name] } == ["id", "user_id", "title"], "FK skipped"
-
-# --- emit_class basic structure ---
-out = SpnlSchema.emit_class(tables[0])
-%w[
-  class\ User
-  attr_accessor\ :id,\ :name
-  def\ self.find
-  def\ self.find!
-  def\ self.all
-  def\ self.create
-  def\ save
-  def\ destroy
-].each do |needle|
-  assert out.include?(needle), "emit contains '#{needle}'"
-end
-
-# --- where_X for string cols ---
-out = SpnlSchema.emit_class(tables[0])
-assert out.include?("where_name"),    "where_name for str col"
-assert !out.include?("where_id"),     "no where_id"
-
-# --- multi-word table name ---
-sql = "CREATE TABLE user_sessions (id INTEGER, token TEXT);"
-tables = SpnlSchema.parse(sql)
-assert tables[0][:class_name] == "UserSession", "user_sessions -> UserSession"
-
-puts "all tests passed (#{tables.length}+ assertions)"
+puts 'SQLite CRUD, defaults, reordered primary key, binds, rollback and RBS passed'

@@ -1,0 +1,32 @@
+name: test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: ['2026.10.25', '60c0273261415d2b5edd6480667a705a68addbd2']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - run: sudo apt-get update && sudo apt-get install -y build-essential libssl-dev libcrypt-dev libsqlite3-dev pkg-config
+      - run: gem install rake --no-document && gem install prism -v 1.9.0 --no-document
+      - run: gem install sqlite3 -v 1.7.3 --no-document
+      - uses: actions/checkout@v4
+        with:
+          repository: matz/spinel
+          ref: ${{ matrix.compiler }}
+          path: .compiler
+      - run: make -C .compiler deps && make -C .compiler -j2
+      - run: echo "$GITHUB_WORKSPACE/.compiler/bin" >> "$GITHUB_PATH"
+      - run: rake test
+      - run: ruby scripts/verify_runtime.rb
+        env:
+          SPINEL: ${{ github.workspace }}/.compiler/bin/spinel
+      - if: matrix.compiler == '60c0273261415d2b5edd6480667a705a68addbd2'
+        run: SPNL_SQLITE_RUNTIME=1 ruby scripts/verify_runtime.rb

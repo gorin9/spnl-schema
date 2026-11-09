@@ -1,73 +1,32 @@
 #!/usr/bin/env ruby
-# Usage:
-#   spnl-schema <schema.sql>                    # 全 table を stdout に
-#   spnl-schema <schema.sql> --table users      # 1 table だけ
-#   spnl-schema <schema.sql> --out-dir app/models/   # table 毎にファイル分割
-#   spnl-schema --check <schema.sql>            # parse のみ, 0/1 で終了
-#   spnl-schema -h
-
+require "optparse"
+require "fileutils"
 require_relative "../lib/spnl_schema"
-
-def usage
-  puts <<~U
-    spnl-schema v#{SpnlSchema::VERSION}
-
-    Usage:
-      spnl-schema <schema.sql>                 print all model classes to stdout
-      spnl-schema <schema.sql> --table NAME    print one table's class
-      spnl-schema <schema.sql> --out-dir DIR   write each table to DIR/<name>.generated.rb
-      spnl-schema --check <schema.sql>         parse only, exit 0 if OK
-      spnl-schema -h | --help
-  U
-  exit 0
+opts = {}
+parser = OptionParser.new do |o|
+  o.banner = 'Usage: spnl-schema SCHEMA.sql [--check] [--table NAME] [--out-dir DIR] [--rbs-dir DIR]'
+  o.on('--check') { opts[:check] = true }
+  o.on('--table NAME') { |x| opts[:table] = x }
+  o.on('--out-dir DIR') { |x| opts[:out] = x }
+  o.on('--rbs-dir DIR') { |x| opts[:rbs] = x }
+  o.on('-h', '--help') { puts o; exit }
 end
-
-if ARGV.empty? || ARGV.include?("-h") || ARGV.include?("--help")
-  usage
-end
-
-if ARGV[0] == "--check"
-  sql = File.read(ARGV[1])
-  tables = SpnlSchema.parse(sql)
-  warn "spnl-schema: parsed #{tables.length} table(s)"
-  exit 0
-end
-
-sql_path = ARGV.shift
-sql = File.read(sql_path)
-tables = SpnlSchema.parse(sql)
-
-filter_table = nil
-out_dir = nil
-while (opt = ARGV.shift)
-  case opt
-  when "--table"   then filter_table = ARGV.shift
-  when "--out-dir" then out_dir = ARGV.shift
-  else
-    warn "spnl-schema: unknown option #{opt}"
-    exit 1
+begin
+  parser.parse!
+  raise ArgumentError, 'expected one schema file' unless ARGV.length == 1
+  tables = SpnlSchema.parse(File.read(ARGV.first))
+  tables = tables.select { |t| t[:name] == opts[:table] } if opts[:table]
+  raise ArgumentError, 'no matching table' if tables.empty?
+  unless opts[:check]
+    [opts[:out], opts[:rbs]].compact.each { |p| FileUtils.mkdir_p(p) }
+    tables.each do |t|
+      stem = t[:class_name].gsub(/([a-z0-9])([A-Z])/, '\1_\2').downcase
+      code = SpnlSchema.emit_class(t)
+      opts[:out] ? File.write(File.join(opts[:out], stem+'.generated.rb'), code) : puts(code)
+      File.write(File.join(opts[:rbs], stem+'.rbs'), SpnlSchema.emit_rbs(t)) if opts[:rbs]
+    end
   end
-end
-
-tables = tables.select { |t| t[:name] == filter_table } if filter_table
-
-if tables.empty?
-  warn "spnl-schema: no table matched"
+rescue ArgumentError, OptionParser::ParseError, Errno::ENOENT => e
+  warn "spnl-schema: #{e.message}"
   exit 1
-end
-
-if out_dir
-  Dir.mkdir(out_dir) unless Dir.exist?(out_dir)
-  tables.each do |t|
-    # users -> user.generated.rb (singular)
-    singular = t[:name].chomp("s")
-    path = File.join(out_dir, "#{singular}.generated.rb")
-    File.write(path, SpnlSchema.emit_class(t))
-    puts "wrote #{path}"
-  end
-else
-  tables.each do |t|
-    puts SpnlSchema.emit_class(t)
-    puts
-  end
 end
